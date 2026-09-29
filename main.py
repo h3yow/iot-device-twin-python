@@ -77,10 +77,59 @@ async def create_batch(request: Request):
         batch = upgrade_service.create_batch(
             body["batch_id"], body["to_version"],
             body["min_from_version"], body["max_failure_ratio"],
+            priority=int(body.get("priority", 0)),
         )
-    except UpgradeError as e:
+    except (UpgradeError, ValueError, TypeError) as e:
         return JSONResponse({"error": str(e)}, status_code=409)
     return asdict(batch) | {"status": batch.status.value}
+
+
+@app.get("/upgrades/batches/{batch_id}")
+def get_batch(batch_id: str):
+    batch = storage.load_batch(batch_id)
+    if batch is None:
+        return JSONResponse({"error": "unknown_batch"}, status_code=404)
+    return (
+        asdict(batch)
+        | {"status": batch.status.value}
+        | {"pause_reason": batch.pause_reason.value if batch.pause_reason else None}
+    )
+
+
+@app.post("/upgrades/batches/{batch_id}/enroll")
+async def enroll_device(batch_id: str, request: Request):
+    body = await request.json()
+    try:
+        upgrade_service.enroll(batch_id, body["device_id"])
+    except UpgradeError as e:
+        return JSONResponse({"error": str(e)}, status_code=409)
+    return {"batch_id": batch_id, "device_id": body["device_id"], "enrolled": True}
+
+
+@app.post("/upgrades/batches/{batch_id}/pause")
+def pause_batch(batch_id: str):
+    try:
+        batch = upgrade_service.pause_batch(batch_id)
+    except UpgradeError as e:
+        return JSONResponse({"error": str(e)}, status_code=409)
+    return (
+        asdict(batch)
+        | {"status": batch.status.value}
+        | {"pause_reason": batch.pause_reason.value if batch.pause_reason else None}
+    )
+
+
+@app.post("/upgrades/batches/{batch_id}/resume")
+def resume_batch(batch_id: str):
+    try:
+        batch = upgrade_service.resume_batch(batch_id)
+    except UpgradeError as e:
+        return JSONResponse({"error": str(e)}, status_code=409)
+    return (
+        asdict(batch)
+        | {"status": batch.status.value}
+        | {"pause_reason": batch.pause_reason.value if batch.pause_reason else None}
+    )
 
 
 @app.post("/upgrades/batches/{batch_id}/dispatch")

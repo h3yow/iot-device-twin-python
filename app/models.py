@@ -46,8 +46,22 @@ class BatchStatus(enum.Enum):
     """升级批次状态。"""
 
     RUNNING = "running"
-    PAUSED = "paused"      # 失败率超门限，停止推进
+    PAUSED = "paused"      # 手动暂停或失败熔断，停止推进
     COMPLETED = "completed"
+
+
+class PauseReason(enum.Enum):
+    """批次进入 PAUSED 的原因，用于区分人工暂停与失败熔断。"""
+
+    MANUAL = "manual"      # 运维主动暂停
+    CIRCUIT = "circuit"    # 失败率达到熔断门限，自动停下
+
+
+class DeviceSlotStatus(enum.Enum):
+    """设备在某批次目标清单中的名额状态。"""
+
+    RESERVED = "reserved"      # 名额在手，可被该批次下发
+    DISPLACED = "displaced"    # 名额曾被更高优先级批次接管，当前不在本批次手里
 
 
 @dataclass(frozen=True)
@@ -88,3 +102,22 @@ class UpgradeBatch:
     min_from_version: str      # 版本门限：低于该版本的设备不允许进入本批次
     max_failure_ratio: float   # 失败率门限，超过则暂停推进
     status: BatchStatus
+    priority: int = 0          # 数值越大优先级越高
+    pause_reason: PauseReason | None = None  # status=PAUSED 时区分手动/熔断
+
+
+@dataclass(frozen=True)
+class BatchDevice:
+    """批次目标设备名额记录：某设备被/曾被纳入某批次。"""
+
+    batch_id: str
+    device_id: str
+    slot: DeviceSlotStatus
+
+
+@dataclass(frozen=True)
+class DeviceOccupancy:
+    """设备当前被哪个推进中的批次占用（名额归属）。"""
+
+    device_id: str
+    batch_id: str

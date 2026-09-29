@@ -7,6 +7,10 @@ import threading
 
 from app.models import (
     BatchStatus,
+    BatchDevice,
+    DeviceOccupancy,
+    DeviceSlotStatus,
+    PauseReason,
     TelemetryRecord,
     TwinState,
     UpgradeBatch,
@@ -37,7 +41,9 @@ CREATE TABLE IF NOT EXISTS upgrade_batches (
     to_version TEXT NOT NULL,
     min_from_version TEXT NOT NULL,
     max_failure_ratio REAL NOT NULL,
-    status TEXT NOT NULL
+    status TEXT NOT NULL,
+    priority INTEGER NOT NULL DEFAULT 0,
+    pause_reason TEXT
 );
 CREATE TABLE IF NOT EXISTS upgrade_tasks (
     task_id TEXT PRIMARY KEY,
@@ -49,6 +55,13 @@ CREATE TABLE IF NOT EXISTS upgrade_tasks (
     updated_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_device ON upgrade_tasks(device_id, status);
+CREATE TABLE IF NOT EXISTS batch_devices (
+    batch_id TEXT NOT NULL,
+    device_id TEXT NOT NULL,
+    slot TEXT NOT NULL,
+    PRIMARY KEY (batch_id, device_id)
+);
+CREATE INDEX IF NOT EXISTS idx_batch_devices_device ON batch_devices(device_id, slot);
 """
 
 _TERMINAL = tuple(s.value for s in TERMINAL_UPGRADE_STATES)
@@ -67,6 +80,19 @@ class Storage:
     def _init_schema(self) -> None:
         with self._lock, self._conn:
             self._conn.executescript(_SCHEMA)
+            # 兼容旧库：upgrade_batches 早期版本没有 priority / pause_reason 列
+            cols = {
+                r["name"]
+                for r in self._conn.execute("PRAGMA table_info(upgrade_batches)").fetchall()
+            }
+            if "priority" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE upgrade_batches ADD COLUMN priority INTEGER NOT NULL DEFAULT 0"
+                )
+            if "pause_reason" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE upgrade_batches ADD COLUMN pause_reason TEXT"
+                )
 
     def close(self) -> None:
         with self._lock:
@@ -158,14 +184,18 @@ class Storage:
     def save_batch(self, batch: UpgradeBatch) -> None:
         with self._lock, self._conn:
             self._conn.execute(
-                "INSERT INTO upgrade_batches VALUES (?,?,?,?,?) "
-                "ON CONFLICT(batch_id) DO UPDATE SET status=excluded.status",
+                "INSERT INTO upgrade_batches VALUES (?,?,?,?,?,?,?) "
+                "ON CONFLICT(batch_id) DO UPDATE SET "
+                "status=excluded.status, priority=excluded.priority, "
+                "pause_reason=excluded.pause_reason",
                 (
                     batch.batch_id,
                     batch.to_version,
                     batch.min_from_version,
                     batch.max_failure_ratio,
                     batch.status.value,
+                    batch.priority,
+                    batch.pause_reason.value if batch.pause_reason else None,
                 ),
             )
 
@@ -176,12 +206,15 @@ class Storage:
             ).fetchone()
         if r is None:
             return None
+        reason = r["pause_reason"]
         return UpgradeBatch(
             batch_id=r["batch_id"],
             to_version=r["to_version"],
             min_from_version=r["min_from_version"],
             max_failure_ratio=r["max_failure_ratio"],
             status=BatchStatus(r["status"]),
+            priority=r["priority"],
+            pause_reason=PauseReason(reason) if reason else None,
         )
 
     def save_task(self, task: UpgradeTask) -> None:
@@ -241,3 +274,77 @@ class Storage:
             status=UpgradeStatus(r["status"]),
             updated_at=r["updated_at"],
         )
+
+    # ---- 批次设备名额 ----
+    def save_batch_device(self, entry: BatchDevice) -> None:
+        """幂等写入/更新 (batch, device) 的名额状态。"""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO batch_devices VALUES (?,?,?) "
+                "ON CONFLICT(batch_id, device_id) DO UPDATE SET slot=excluded.slot",
+                (entry.batch_id, entry.device_id, entry.slot.value),
+            )
+
+    def load_batch_devices(self, batch_id: str) -> list[BatchDevice]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM batch_devices WHERE batch_id=?", (batch_id,)
+            ).fetchall()
+        return [
+            BatchDevice(
+                batch_id=r["batch_id"],
+                device_id=r["device_id"],
+                slot=DeviceSlotStatus(r["slot"]),
+            )
+            for r in rows
+        ]
+
+    def reserved_slot(self, batch_id: str, device_id: str) -> BatchDevice | None:
+        """该批次是否持有该设备的有效名额。"""
+        with self._lock:
+            r = self._conn.execute(
+                "SELECT * FROM batch_devices WHERE batch_id=? AND device_id=? AND slot=?",
+                (batch_id, device_id, DeviceSlotStatus.RESERVED.value),
+            ).fetchone()
+        if r is None:
+            return None
+        return BatchDevice(
+            batch_id=r["batch_id"],
+            device_id=r["device_id"],
+            slot=DeviceSlotStatus(r["slot"]),
+        )
+
+    def device_occupancy(self, device_id: str) -> DeviceOccupancy | None:
+        """设备当前被哪个批次占用：有效名额的批次且批次仍在 RUNNING 才算占住名额。
+
+        暂停/熔断/完成的批次名额视为已释放；同设备理论上至多一个有效占用。
+        注意：名额是否“已使用（已下发过任务）”由 service 层进一步判定。
+        """
+        with self._lock:
+            r = self._conn.execute(
+                "SELECT bd.batch_id AS batch_id, bd.device_id AS device_id "
+                "FROM batch_devices bd "
+                "JOIN upgrade_batches ub ON ub.batch_id = bd.batch_id "
+                "WHERE bd.device_id=? AND bd.slot=? AND ub.status=? "
+                "ORDER BY ub.priority DESC LIMIT 1",
+                (
+                    device_id,
+                    DeviceSlotStatus.RESERVED.value,
+                    BatchStatus.RUNNING.value,
+                ),
+            ).fetchone()
+        if r is None:
+            return None
+        return DeviceOccupancy(device_id=r["device_id"], batch_id=r["batch_id"])
+
+    def reserved_batches_for_device(self, device_id: str) -> list[str]:
+        """所有对该设备持有 RESERVED 名额的批次 id，按批次优先级降序。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT bd.batch_id AS batch_id FROM batch_devices bd "
+                "JOIN upgrade_batches ub ON ub.batch_id = bd.batch_id "
+                "WHERE bd.device_id=? AND bd.slot=? "
+                "ORDER BY ub.priority DESC",
+                (device_id, DeviceSlotStatus.RESERVED.value),
+            ).fetchall()
+        return [r["batch_id"] for r in rows]

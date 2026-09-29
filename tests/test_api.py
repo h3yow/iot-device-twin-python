@@ -1,4 +1,4 @@
-"""HTTP 端到端：遥测接入 -> 孪生可见 -> 升级下发。"""
+"""HTTP 端到端：遥测接入 -> 孪生可见 -> 升级下发；批次暂停/恢复/熔断。"""
 import os
 import tempfile
 
@@ -8,46 +8,86 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from main import app  # noqa: E402
 
+# 共享一个 TestClient：lifespan 只启动一次，避免退出时关闭全局 SQLite 后
+# 后续用例拿到已关闭连接。
+client = TestClient(app)
+
 
 def test_http_end_to_end():
-    with TestClient(app) as client:
-        # 遥测上行
-        r = client.post("/telemetry", json={
-            "device_id": "dev-1", "seq": 1, "schema_version": 1,
-            "payload": {"temp": 22},
-        })
-        assert r.status_code == 200 and r.json()["result"] == "applied"
+    # 遥测上行
+    r = client.post("/telemetry", json={
+        "device_id": "dev-1", "seq": 1, "schema_version": 1,
+        "payload": {"temp": 22},
+    })
+    assert r.status_code == 200 and r.json()["result"] == "applied"
 
-        # 非法负载可区分
-        r = client.post("/telemetry", json={"device_id": "dev-1", "seq": 2})
-        assert r.status_code == 422 and r.json()["reason"] == "missing_field"
+    # 非法负载可区分
+    r = client.post("/telemetry", json={"device_id": "dev-1", "seq": 2})
+    assert r.status_code == 422 and r.json()["reason"] == "missing_field"
 
-        # 孪生查询
-        r = client.get("/twins/dev-1")
-        assert r.json()["reported"] == {"temp": 22}
+    # 孪生查询
+    r = client.get("/twins/dev-1")
+    assert r.json()["reported"] == {"temp": 22}
 
-        # desired 更新与冲突
-        r = client.patch("/twins/dev-1/desired",
-                         json={"patch": {"target": 25}, "expected_version": 0})
-        assert r.json()["desired_version"] == 1
-        r = client.patch("/twins/dev-1/desired",
-                         json={"patch": {"target": 26}, "expected_version": 0})
-        assert r.status_code == 409
+    # desired 更新与冲突
+    r = client.patch("/twins/dev-1/desired",
+                     json={"patch": {"target": 25}, "expected_version": 0})
+    assert r.json()["desired_version"] == 1
+    r = client.patch("/twins/dev-1/desired",
+                     json={"patch": {"target": 26}, "expected_version": 0})
+    assert r.status_code == 409
 
-        # 升级批次与下发
-        r = client.post("/upgrades/batches", json={
-            "batch_id": "b1", "to_version": "2.0.0",
-            "min_from_version": "1.0.0", "max_failure_ratio": 0.5,
-        })
-        assert r.status_code == 200
-        r = client.post("/upgrades/batches/b1/dispatch",
-                        json={"device_id": "dev-1", "from_version": "1.2.0"})
-        task_id = r.json()["task_id"]
-        # 重复下发被拒
-        r = client.post("/upgrades/batches/b1/dispatch",
-                        json={"device_id": "dev-1", "from_version": "1.2.0"})
-        assert r.status_code == 409
-        r = client.post(f"/upgrades/tasks/{task_id}/progress",
-                        json={"status": "downloading"})
-        assert r.json()["status"] == "downloading"
-        print(f"[判定依据] 端到端链路通过，任务 {task_id[:8]} 状态=downloading")
+    # 升级批次与下发
+    r = client.post("/upgrades/batches", json={
+        "batch_id": "b1", "to_version": "2.0.0",
+        "min_from_version": "1.0.0", "max_failure_ratio": 0.5,
+    })
+    assert r.status_code == 200
+    r = client.post("/upgrades/batches/b1/dispatch",
+                    json={"device_id": "dev-1", "from_version": "1.2.0"})
+    task_id = r.json()["task_id"]
+    # 重复下发被拒
+    r = client.post("/upgrades/batches/b1/dispatch",
+                    json={"device_id": "dev-1", "from_version": "1.2.0"})
+    assert r.status_code == 409
+    r = client.post(f"/upgrades/tasks/{task_id}/progress",
+                    json={"status": "downloading"})
+    assert r.json()["status"] == "downloading"
+    print(f"[判定依据] 端到端链路通过，任务 {task_id[:8]} 状态=downloading")
+
+
+def test_http_pause_resume_and_circuit_reason():
+    r = client.post("/upgrades/batches", json={
+        "batch_id": "bc", "to_version": "3.0.0",
+        "min_from_version": "1.0.0", "max_failure_ratio": 0.0,
+    })
+    assert r.status_code == 200 and r.json()["priority"] == 0
+
+    # enroll + 手动暂停
+    r = client.post("/upgrades/batches/bc/enroll", json={"device_id": "dx"})
+    assert r.status_code == 200 and r.json()["enrolled"] is True
+    r = client.post("/upgrades/batches/bc/pause")
+    assert r.status_code == 200
+    assert r.json()["status"] == "paused"
+    assert r.json()["pause_reason"] == "manual"
+    # 暂停中下发被拒
+    r = client.post("/upgrades/batches/bc/dispatch",
+                    json={"device_id": "dy", "from_version": "1.1.0"})
+    assert r.status_code == 409
+    # 查询批次状态
+    r = client.get("/upgrades/batches/bc")
+    assert r.json()["pause_reason"] == "manual"
+    # 恢复后可继续推进
+    r = client.post("/upgrades/batches/bc/resume")
+    assert r.json()["status"] == "running"
+    r = client.post("/upgrades/batches/bc/dispatch",
+                    json={"device_id": "dy", "from_version": "1.1.0"})
+    assert r.status_code == 200
+    tid = r.json()["task_id"]
+    # 单任务失败 -> 熔断（门限 0.0）
+    r = client.post(f"/upgrades/tasks/{tid}/progress", json={"status": "failed"})
+    assert r.status_code == 200
+    r = client.get("/upgrades/batches/bc")
+    assert r.json()["status"] == "paused"
+    assert r.json()["pause_reason"] == "circuit"
+    print("[判定依据] HTTP：暂停=manual、恢复继续推进、失败熔断=circuit")

@@ -84,9 +84,17 @@ def test_interrupted_upgrade_times_out_and_device_can_redispatch(svc):
     assert [x.task_id for x in timed_out] == [t.task_id]
     assert timed_out[0].status is UpgradeStatus.TIMEOUT
 
-    # 超时为终态：同设备可重新下发（如修复后重试）
-    t2 = service.dispatch("b-retry", "d1", "1.2.0")
+    # 超时为终态：同一批次内不允许再次向该设备下发（失败设备不重复下发）
+    with pytest.raises(UpgradeError, match="already has task"):
+        service.dispatch("b-retry", "d1", "1.2.0")
+
+    # 修复后的重试只能通过新批次发起（旧任务已终态，容量已释放）
+    service.create_batch("b-retry-2", to_version="2.0.1", min_from_version="1.0.0",
+                         max_failure_ratio=1.0)
+    t2 = service.dispatch("b-retry-2", "d1", "1.2.0")
     assert t2.task_id != t.task_id
+    print(f"[判定依据] 超时设备 d1 不再进旧批次，由新批次 b-retry-2 重新下发 "
+          f"task={t2.task_id[:8]}")
 
 
 def test_terminal_task_rejects_further_progress(svc):
