@@ -46,8 +46,15 @@ class BatchStatus(enum.Enum):
     """升级批次状态。"""
 
     RUNNING = "running"
-    PAUSED = "paused"      # 失败率超门限，停止推进
+    PAUSED = "paused"      # 手动暂停或失败熔断，停止推进
     COMPLETED = "completed"
+
+
+class PauseReason(enum.Enum):
+    """批次处于 PAUSED 的原因：区分手动暂停与失败熔断。"""
+
+    MANUAL = "manual"                    # 运维主动暂停
+    CIRCUIT_BREAKER = "circuit_breaker"  # 失败/超时比例超门限自动熔断
 
 
 @dataclass(frozen=True)
@@ -88,3 +95,6 @@ class UpgradeBatch:
     min_from_version: str      # 版本门限：低于该版本的设备不允许进入本批次
     max_failure_ratio: float   # 失败率门限，超过则暂停推进
     status: BatchStatus
+    priority: int = 0          # 数值越大优先级越高，争抢设备时优先占用
+    created_at: float = 0.0    # 创建时间，同优先级时先创建者优先
+    pause_reason: PauseReason | None = None  # status=PAUSED 时记录暂停原因

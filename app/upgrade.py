@@ -8,6 +8,7 @@ from collections.abc import Callable
 
 from app.models import (
     BatchStatus,
+    PauseReason,
     TERMINAL_UPGRADE_STATES,
     UpgradeBatch,
     UpgradeStatus,
@@ -45,10 +46,18 @@ class UpgradeService:
     """升级约束：
 
     - 同一设备同一时刻至多一个进行中（非终态）任务；
+    - 同一批次内同一台设备至多被下发一次：已完成/失败/超时/取消的设备，
+      在该批次内永远不会再次收到任务；
     - 设备当前版本必须 >= 批次 min_from_version（版本门限）；
-    - 批次 PAUSED/COMPLETED 后禁止继续下发；
-    - 失败(含超时)设备数 / 批次任务总数 > max_failure_ratio 时批次自动 PAUSED，
-      停止继续推进；
+    - 批次仅 RUNNING 时可下发；PAUSED（手动暂停或熔断）/COMPLETED 一律停止；
+    - 暂停（pause_batch）只阻止新下发，进行中的任务允许自然结束；
+      恢复（resume_batch）后按原进度继续推进；
+    - 失败(含超时)设备数 / 批次任务总数 > max_failure_ratio 时批次自动熔断，
+      状态 PAUSED 且 pause_reason=circuit_breaker，停止继续推进；
+    - 设备名额：RUNNING 批次内（设备名下，任务处于任意状态）的设备视为被该批次
+      占用；暂停/熔断/收尾后不再占用，释放给其他批次。其他 RUNNING 批次想下发
+      被占用的设备时，只有当自己优先级更高（priority 大；相同则创建更早）
+      才能抢到名额；低优先级批次既不能抢走设备，也不会留下任何中间状态；
     - 任务状态机迁移非法时抛 UpgradeError。
     """
 
@@ -58,7 +67,12 @@ class UpgradeService:
         self._lock = threading.Lock()
 
     def create_batch(
-        self, batch_id: str, to_version: str, min_from_version: str, max_failure_ratio: float
+        self,
+        batch_id: str,
+        to_version: str,
+        min_from_version: str,
+        max_failure_ratio: float,
+        priority: int = 0,
     ) -> UpgradeBatch:
         parse_version(to_version)
         parse_version(min_from_version)
@@ -73,27 +87,62 @@ class UpgradeService:
                 min_from_version=min_from_version,
                 max_failure_ratio=max_failure_ratio,
                 status=BatchStatus.RUNNING,
+                priority=priority,
+                created_at=self._clock(),
             )
             self._storage.save_batch(batch)
             return batch
 
     def dispatch(self, batch_id: str, device_id: str, from_version: str) -> UpgradeTask:
-        """下发升级；违反门限/并发约束时抛 UpgradeError。"""
+        """下发升级；违反门限/并发/批次状态/名额争抢约束时抛 UpgradeError。
+
+        全部判定与落盘在同一把锁内完成：被挡下时不会创建任何任务，
+        不留下半推半就的中间状态。
+        """
         with self._lock:
             batch = self._storage.load_batch(batch_id)
             if batch is None:
                 raise UpgradeError(f"unknown batch: {batch_id}")
             if batch.status != BatchStatus.RUNNING:
-                raise UpgradeError(f"batch {batch_id} is {batch.status.value}, dispatch stopped")
+                raise UpgradeError(
+                    f"batch {batch_id} is {batch.status.value}"
+                    + (
+                        f" ({batch.pause_reason.value})"
+                        if batch.pause_reason is not None
+                        else ""
+                    )
+                    + ", dispatch stopped"
+                )
             if parse_version(from_version) < parse_version(batch.min_from_version):
                 raise UpgradeError(
                     f"device {device_id} version {from_version} below gate "
                     f"{batch.min_from_version}"
                 )
+            # 同批次内设备唯一：已下发过的设备（含失败/超时等终态）不再下发
+            existing = self._storage.task_for_batch_device(batch_id, device_id)
+            if existing is not None:
+                raise UpgradeError(
+                    f"device {device_id} already dispatched in batch {batch_id} "
+                    f"as task {existing.task_id} ({existing.status.value})"
+                )
+            # 全局：同设备同时刻至多一个进行中任务
             active = self._storage.active_task_for_device(device_id)
             if active is not None:
                 raise UpgradeError(
                     f"device {device_id} already has active task {active.task_id}"
+                )
+            # 名额争抢：设备在任一时刻只有一个属主批次——所有 RUNNING 且
+            # 名下已有该设备任务的批次，加上当前请求批次，一起按
+            # 优先级/创建时间排名；排名最高者才是属主。当前批次只有本身
+            # 就是属主时才能下发，即高优先级可以抢占、低优先级不能从属主
+            # 手里抢设备；整个判定在同一把锁内完成，被挡下时不创建任务，
+            # 不留下半推半就的中间状态。
+            holder = self._holder_of(device_id, contender=batch)
+            if holder.batch_id != batch_id:
+                raise UpgradeError(
+                    f"device {device_id} held by batch {holder.batch_id} "
+                    f"(priority {holder.priority}); batch {batch_id} "
+                    f"priority {batch.priority} cannot preempt"
                 )
             task = UpgradeTask(
                 task_id=uuid.uuid4().hex,
@@ -106,6 +155,61 @@ class UpgradeService:
             )
             self._storage.save_task(task)
             return task
+
+    def _holder_of(
+        self, device_id: str, contender: UpgradeBatch | None = None
+    ) -> UpgradeBatch | None:
+        """设备当前的属主批次：RUNNING 且名下有该设备任务的批次中排名最高者。
+
+        排名即 load_batches 的返回顺序（priority 降序、created_at 升序、
+        batch_id 升序）；暂停/熔断/收尾的批次不参与，故暂停后名额自然顺延。
+        contender 作为尚未落任务行的虚拟候选（下发请求方）一起参与排名。
+        """
+        best: UpgradeBatch | None = None
+        for candidate in self._storage.load_batches():
+            if candidate.status != BatchStatus.RUNNING:
+                continue
+            if candidate.batch_id == (contender.batch_id if contender is not None else None):
+                c = contender  # 用内存中的请求批次（含最新 priority/created_at）
+            elif self._storage.task_for_batch_device(candidate.batch_id, device_id) is None:
+                continue
+            else:
+                c = candidate
+            if best is None:
+                best = c
+        return best if best is not None else contender
+
+    def pause_batch(self, batch_id: str) -> UpgradeBatch:
+        """手动暂停批次：停止新下发，进行中任务允许自然结束。
+
+        已经因熔断暂停的批次保持熔断原因不变（手动暂停不能覆盖熔断事实）。
+        """
+        with self._lock:
+            batch = self._storage.load_batch(batch_id)
+            if batch is None:
+                raise UpgradeError(f"unknown batch: {batch_id}")
+            if batch.status == BatchStatus.COMPLETED:
+                raise UpgradeError(f"batch {batch_id} already completed")
+            if batch.status == BatchStatus.RUNNING:
+                batch.status = BatchStatus.PAUSED
+                batch.pause_reason = PauseReason.MANUAL
+                self._storage.save_batch(batch)
+            return batch
+
+    def resume_batch(self, batch_id: str) -> UpgradeBatch:
+        """恢复暂停的批次：接着原进度推进，已终态设备不会被重新下发。"""
+        with self._lock:
+            batch = self._storage.load_batch(batch_id)
+            if batch is None:
+                raise UpgradeError(f"unknown batch: {batch_id}")
+            if batch.status != BatchStatus.PAUSED:
+                raise UpgradeError(
+                    f"batch {batch_id} is {batch.status.value}, only paused can resume"
+                )
+            batch.status = BatchStatus.RUNNING
+            batch.pause_reason = None
+            self._storage.save_batch(batch)
+            return batch
 
     def report_progress(self, task_id: str, status: UpgradeStatus) -> UpgradeTask:
         """设备回报升级进度；非法迁移抛 UpgradeError。"""
@@ -150,6 +254,7 @@ class UpgradeService:
             if any(t.status not in TERMINAL_UPGRADE_STATES for t in tasks):
                 raise UpgradeError(f"batch {batch_id} still has active tasks")
             batch.status = BatchStatus.COMPLETED
+            batch.pause_reason = None
             self._storage.save_batch(batch)
             return batch
 
@@ -173,4 +278,5 @@ class UpgradeService:
         )
         if failed / len(tasks) > batch.max_failure_ratio:
             batch.status = BatchStatus.PAUSED
+            batch.pause_reason = PauseReason.CIRCUIT_BREAKER
             self._storage.save_batch(batch)

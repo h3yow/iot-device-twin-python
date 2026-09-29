@@ -77,10 +77,38 @@ async def create_batch(request: Request):
         batch = upgrade_service.create_batch(
             body["batch_id"], body["to_version"],
             body["min_from_version"], body["max_failure_ratio"],
+            priority=int(body.get("priority", 0)),
         )
+    except (UpgradeError, ValueError, TypeError) as e:
+        return JSONResponse({"error": str(e)}, status_code=409)
+    return asdict(batch) | {
+        "status": batch.status.value,
+        "pause_reason": batch.pause_reason.value if batch.pause_reason else None,
+    }
+
+
+@app.post("/upgrades/batches/{batch_id}/pause")
+async def pause_batch(batch_id: str):
+    try:
+        batch = upgrade_service.pause_batch(batch_id)
     except UpgradeError as e:
         return JSONResponse({"error": str(e)}, status_code=409)
-    return asdict(batch) | {"status": batch.status.value}
+    return asdict(batch) | {
+        "status": batch.status.value,
+        "pause_reason": batch.pause_reason.value if batch.pause_reason else None,
+    }
+
+
+@app.post("/upgrades/batches/{batch_id}/resume")
+async def resume_batch(batch_id: str):
+    try:
+        batch = upgrade_service.resume_batch(batch_id)
+    except UpgradeError as e:
+        return JSONResponse({"error": str(e)}, status_code=409)
+    return asdict(batch) | {
+        "status": batch.status.value,
+        "pause_reason": batch.pause_reason.value if batch.pause_reason else None,
+    }
 
 
 @app.post("/upgrades/batches/{batch_id}/dispatch")

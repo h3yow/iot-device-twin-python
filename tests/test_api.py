@@ -51,3 +51,21 @@ def test_http_end_to_end():
                         json={"status": "downloading"})
         assert r.json()["status"] == "downloading"
         print(f"[判定依据] 端到端链路通过，任务 {task_id[:8]} 状态=downloading")
+
+        # 暂停/恢复可通过 HTTP 操作，pause_reason 明确区分手动暂停与熔断
+        r = client.post("/upgrades/batches/b1/pause")
+        assert r.status_code == 200
+        assert r.json()["status"] == "paused"
+        assert r.json()["pause_reason"] == "manual"
+        r = client.post("/upgrades/batches/b1/dispatch",
+                        json={"device_id": "dev-2", "from_version": "1.0.0"})
+        assert r.status_code == 409  # 暂停期间停止下发
+        r = client.post("/upgrades/batches/b1/resume")
+        assert r.json()["status"] == "running" and r.json()["pause_reason"] is None
+
+        # 带优先级的批次
+        r = client.post("/upgrades/batches", json={
+            "batch_id": "b2", "to_version": "3.0.0",
+            "min_from_version": "1.0.0", "max_failure_ratio": 0.5, "priority": 7,
+        })
+        assert r.status_code == 200 and r.json()["priority"] == 7
