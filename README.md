@@ -78,20 +78,36 @@ tests/             单测（日志打印关键输入与判定依据）
 `create_batch` 接受可选 `priority`（整数，默认 0，数值越大优先级越高）。
 
 - 同一台设备在任一时刻只归属于一个**正在推进（RUNNING）的属主批次**：属主是
-  "RUNNING 且名下已有该设备任务"的批次中排名最高者，排名按
-  `priority` 降序、创建时间升序、`batch_id` 升序决出。
-- 下发时当前批次必须就是属主：高优先级批次可以先占用设备（从仍 RUNNING 的
-  低优批次手里"抢"到尚未被下发的终态名额），被挡下的低优批次**不能**把设备
-  从别人手里抢走；所有判定与落盘在同一把锁内完成，被挡下时不会创建任务，
-  不留下半推半就的中间状态（HTTP 409，任务表中无该批次该设备的记录）。
+  "RUNNING 且名下有该设备占用任务"的批次中排名最高者，排名按
+  `priority` 降序、创建时间升序、`batch_id` 升序决出。占用任务指该批次名下
+  该设备的**非 `cancelled`** 任务（含 success/failed/timeout 终态）；
+  被抢占取消（`cancelled`）的任务只是终态历史记录，不再占用名额。
+- 下发时当前批次必须就是属主：被挡下的低优批次**不能**把设备从属主手里抢走；
+  所有判定与落盘在同一把锁内完成，被挡下时不会创建任务，不留下半推半就的
+  中间状态（HTTP 409，任务表中无该批次该设备的记录）。
+- **在途抢占**：属主批次下发时，若设备上还挂着其他批次的进行中任务——
+  - 对方是**优先级严格更低**的 RUNNING 批次：其在途任务被立即置为
+    `cancelled`（终态），本批次直接接管，无需等对方跑完或超时；
+  - 对方是**已暂停/熔断/收尾**的批次（名额已释放）：其在途任务同样被
+    取消，设备不会被一直挂住；
+  - 对方是**同优先级或更高优先级**的 RUNNING 批次：在途任务不可抢，
+    下发被挡（同优先级在途任务先占先得）。
+  被取消的任务进入终态：原批次内永不重发，设备迟到回报也会被状态机拒绝；
+  且 `cancelled` 不占用名额，原批次恢复后也不会形成"僵尸占用"挡住别人。
+- 高优先级批次接管设备之后，低优先级批次无论继续推进还是暂停/恢复，都不能
+  把设备抢回去（同批次设备唯一性约束 + 属主排名双重保证），同一台设备绝不
+  会被同时下发两次。
 - 批次被**暂停（手动或熔断）或收尾后不再参与属主排名**，它占用的设备名额
-  立即顺延释放给其他 RUNNING 批次；批次恢复后按上面的排名规则重新参与，
-  不会自动抢回已被其他批次占用的设备。
-- 兼容范围：设备名额是"软占用"——高优批次仍可向尚无更高属主的设备下发；
-  优先级只决定争抢结果，不会取消或迁移其他批次已经在跑的任务；进行中的
-  设备仍受全局"单设备单进行中任务"约束，其他批次须等其自然结束。
+  （含在途任务）立即释放给其他 RUNNING 批次；批次恢复后按排名规则重新参与，
+  已被接管的设备不会自动抢回。
+- 兼容范围：设备名额是"软占用"——任何批次仍可向尚无属主的设备下发；优先级
+  只决定争抢结果，不会迁移其他批次的任务内容；抢占仅发生在下发时刻，
+  不会后台批量取消任务；`cancelled` 不计入失败率，不会触发熔断。
 
 HTTP 接口：`POST /upgrades/batches`（可带 `priority`）、
+`GET /upgrades/batches/{id}`（直接查询 `status` 与 `pause_reason`，区分
+手动暂停 `manual`、失败熔断 `circuit_breaker` 与正常跑完 `completed`，
+不靠下发时报错去猜）、
 `POST /upgrades/batches/{id}/pause`、`POST /upgrades/batches/{id}/resume`、
 `POST /upgrades/batches/{id}/dispatch`、
 `POST /upgrades/tasks/{id}/progress`、`POST /upgrades/check-timeouts`。
@@ -119,16 +135,54 @@ curl -s -XPOST localhost:8000/upgrades/batches/b1/dispatch \
   -d '{"device_id":"d2","from_version":"1.2.0"}'
 # 暂停后再下发：409 dispatch stopped；在途任务仍可 POST .../progress 自然结束
 curl -s -XPOST localhost:8000/upgrades/batches/b1/pause
+curl -s localhost:8000/upgrades/batches/b1   # 直接查状态：paused / pause_reason=manual
 curl -s -XPOST localhost:8000/upgrades/batches/b1/resume
 
-# 跨批次争抢：b2 priority=10 可先占设备；低优批次同设备下发返回 409 cannot preempt；
-# 高优批次 pause/熔断后，名额释放给其他批次
+# 跨批次争抢与在途抢占：
+# 1) 低优批次 b-low(priority=1) 先下发 d10 并进入 downloading（在途）
+curl -s -XPOST localhost:8000/upgrades/batches -d '{
+  "batch_id":"b-low","to_version":"2.0.0","min_from_version":"1.0.0",
+  "max_failure_ratio":1.0,"priority":1}'
+curl -s -XPOST localhost:8000/upgrades/batches/b-low/dispatch \
+  -d '{"device_id":"d10","from_version":"1.2.0"}'   # 记下返回的 task_id
+curl -s -XPOST localhost:8000/upgrades/tasks/<low_task_id>/progress \
+  -d '{"status":"downloading"}'
+
+# 2) 高优批次 b-high(priority=10) 后到下发同一台设备 d10：直接抢占成功，
+#    b-low 的在途任务被置为 cancelled（终态，b-low 内永不重发）
+curl -s -XPOST localhost:8000/upgrades/batches -d '{
+  "batch_id":"b-high","to_version":"3.0.0","min_from_version":"1.0.0",
+  "max_failure_ratio":1.0,"priority":10}'
+curl -s -XPOST localhost:8000/upgrades/batches/b-high/dispatch \
+  -d '{"device_id":"d10","from_version":"1.2.0"}'   # 200，返回新 task_id
+
+# 3) 低优批次抢不回：重发同一设备返回 409 already dispatched；
+#    暂停/恢复后依旧 409
+curl -s -XPOST localhost:8000/upgrades/batches/b-low/dispatch \
+  -d '{"device_id":"d10","from_version":"1.2.0"}'   # 409 already dispatched
+curl -s -XPOST localhost:8000/upgrades/batches/b-low/pause
+curl -s -XPOST localhost:8000/upgrades/batches/b-low/resume
+curl -s -XPOST localhost:8000/upgrades/batches/b-low/dispatch \
+  -d '{"device_id":"d10","from_version":"1.2.0"}'   # 仍 409
+
+# 4) 高优批次暂停后名额立即释放：其他批次（哪怕优先级更低）可马上接管
+#    其名下设备；批次状态与停下原因可直接查询：
+#    status=paused & pause_reason=manual（手动暂停）
+#    status=paused & pause_reason=circuit_breaker（失败熔断）
+#    status=completed（正常收尾）
+curl -s -XPOST localhost:8000/upgrades/batches/b-high/pause   # pause_reason=manual
 ```
+
+同优先级批次争抢同一台设备时：在途任务先占先得（后到者 409
+`cannot preempt inflight`，任务表无残留）；对方任务终态后，创建更早的批次
+凭排名接管。
 
 测试覆盖：重复/乱序/迟到遥测、非法负载四类拒绝原因、100 线程并发孪生写入、
 desired 乐观锁冲突、重启后状态与在线判定重建、10 线程并发重复下发、
 版本门限、失败熔断（`pause_reason=circuit_breaker` 可区分）、
 升级中断超时与跨批次重试、暂停后停发/在途任务自然结束/恢复续跑不重发、
 熔断原因识别与失败/超时设备永不重发、跨批次优先级争抢（含低优被挡无残留、
-暂停与熔断释放名额、同优先级先创建者优先）、12 线程跨批次并发争抢无中间状态、
-HTTP 端到端链路。
+暂停与熔断释放名额、同优先级先创建者优先）、低优先发高优后到的在途抢占、
+高优接管后低优恢复也抢不回、同优先级在途任务不可抢（终态后按创建先后接管）、
+暂停/熔断批次在途设备名额立即释放、12 线程同优先级跨批次并发争抢无中间状态、
+12 线程高低优先级并发争抢高优必胜、HTTP 端到端链路。

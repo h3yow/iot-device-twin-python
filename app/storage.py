@@ -271,18 +271,7 @@ class Storage:
             args = (batch_id,)
         with self._lock:
             rows = self._conn.execute(sql, args).fetchall()
-        return [
-            UpgradeTask(
-                task_id=r["task_id"],
-                device_id=r["device_id"],
-                batch_id=r["batch_id"],
-                from_version=r["from_version"],
-                to_version=r["to_version"],
-                status=UpgradeStatus(r["status"]),
-                updated_at=r["updated_at"],
-            )
-            for r in rows
-        ]
+        return [self._row_to_task(r) for r in rows]
 
     def task_for_batch_device(self, batch_id: str, device_id: str) -> UpgradeTask | None:
         """该设备在指定批次内是否已有任务（任意状态，含终态）。"""
@@ -293,6 +282,28 @@ class Storage:
             ).fetchone()
         if r is None:
             return None
+        return self._row_to_task(r)
+
+    def occupying_task_for_batch_device(
+        self, batch_id: str, device_id: str
+    ) -> UpgradeTask | None:
+        """该设备在该批次名下占用名额的任务。
+
+        CANCELLED（被抢占/取消）的任务不再占用名额：设备已被别的批次接
+        管，原批次保留的只是一条终态历史记录，不构成占用。
+        """
+        with self._lock:
+            r = self._conn.execute(
+                "SELECT * FROM upgrade_tasks WHERE batch_id=? AND device_id=? "
+                "AND status != ?",
+                (batch_id, device_id, UpgradeStatus.CANCELLED.value),
+            ).fetchone()
+        if r is None:
+            return None
+        return self._row_to_task(r)
+
+    @staticmethod
+    def _row_to_task(r: sqlite3.Row) -> UpgradeTask:
         return UpgradeTask(
             task_id=r["task_id"],
             device_id=r["device_id"],
@@ -304,21 +315,20 @@ class Storage:
         )
 
     def active_task_for_device(self, device_id: str) -> UpgradeTask | None:
+        tasks = self.active_tasks_for_device(device_id)
+        return tasks[0] if tasks else None
+
+    def active_tasks_for_device(self, device_id: str) -> list[UpgradeTask]:
+        """该设备名下全部进行中（非终态）任务，按 updated_at 降序。
+
+        不变式是同一设备至多一个进行中任务；返回列表是为了在读取历史
+        遗留库（或抢占清理）时不漏掉任何一条。
+        """
         placeholders = ",".join("?" for _ in _TERMINAL)
         with self._lock:
-            r = self._conn.execute(
+            rows = self._conn.execute(
                 f"SELECT * FROM upgrade_tasks WHERE device_id=? "
-                f"AND status NOT IN ({placeholders}) ORDER BY updated_at DESC LIMIT 1",
+                f"AND status NOT IN ({placeholders}) ORDER BY updated_at DESC",
                 (device_id, *_TERMINAL),
-            ).fetchone()
-        if r is None:
-            return None
-        return UpgradeTask(
-            task_id=r["task_id"],
-            device_id=r["device_id"],
-            batch_id=r["batch_id"],
-            from_version=r["from_version"],
-            to_version=r["to_version"],
-            status=UpgradeStatus(r["status"]),
-            updated_at=r["updated_at"],
-        )
+            ).fetchall()
+        return [self._row_to_task(r) for r in rows]

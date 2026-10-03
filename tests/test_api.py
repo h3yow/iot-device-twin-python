@@ -63,6 +63,26 @@ def test_http_end_to_end():
         r = client.post("/upgrades/batches/b1/resume")
         assert r.json()["status"] == "running" and r.json()["pause_reason"] is None
 
+        # 批次状态可直接查询，不靠下发报错去猜
+        r = client.get("/upgrades/batches/b1")
+        assert r.status_code == 200 and r.json()["status"] == "running"
+        r = client.get("/upgrades/batches/b-nope")
+        assert r.status_code == 404
+
+        # 触发熔断：再下发两台并都失败（2/3 > 0.5），批次自动停掉
+        for dev in ("dev-2", "dev-3"):
+            r = client.post("/upgrades/batches/b1/dispatch",
+                            json={"device_id": dev, "from_version": "1.0.0"})
+            tid = r.json()["task_id"]
+            r = client.post(f"/upgrades/tasks/{tid}/progress",
+                            json={"status": "failed"})
+            assert r.status_code == 200
+        r = client.get("/upgrades/batches/b1")
+        assert r.json()["status"] == "paused"
+        assert r.json()["pause_reason"] == "circuit_breaker"  # 熔断，可区分
+        print("[判定依据] GET /upgrades/batches/b1：手动暂停=pause_reason manual，"
+              "失败率 2/3 熔断后=paused/circuit_breaker，均可直接查询")
+
         # 带优先级的批次
         r = client.post("/upgrades/batches", json={
             "batch_id": "b2", "to_version": "3.0.0",

@@ -70,6 +70,23 @@ async def patch_desired(device_id: str, request: Request):
 
 
 # ---- 升级 ----
+def _batch_body(batch):
+    return asdict(batch) | {
+        "status": batch.status.value,
+        "pause_reason": batch.pause_reason.value if batch.pause_reason else None,
+    }
+
+
+@app.get("/upgrades/batches/{batch_id}")
+def get_batch(batch_id: str):
+    """直接查询批次状态与停下原因（manual/circuit_breaker/正常跑完）。"""
+    try:
+        batch = upgrade_service.get_batch(batch_id)
+    except UpgradeError as e:
+        return JSONResponse({"error": str(e)}, status_code=404)
+    return _batch_body(batch)
+
+
 @app.post("/upgrades/batches")
 async def create_batch(request: Request):
     body = await request.json()
@@ -81,10 +98,7 @@ async def create_batch(request: Request):
         )
     except (UpgradeError, ValueError, TypeError) as e:
         return JSONResponse({"error": str(e)}, status_code=409)
-    return asdict(batch) | {
-        "status": batch.status.value,
-        "pause_reason": batch.pause_reason.value if batch.pause_reason else None,
-    }
+    return _batch_body(batch)
 
 
 @app.post("/upgrades/batches/{batch_id}/pause")
@@ -93,10 +107,7 @@ async def pause_batch(batch_id: str):
         batch = upgrade_service.pause_batch(batch_id)
     except UpgradeError as e:
         return JSONResponse({"error": str(e)}, status_code=409)
-    return asdict(batch) | {
-        "status": batch.status.value,
-        "pause_reason": batch.pause_reason.value if batch.pause_reason else None,
-    }
+    return _batch_body(batch)
 
 
 @app.post("/upgrades/batches/{batch_id}/resume")
@@ -105,10 +116,7 @@ async def resume_batch(batch_id: str):
         batch = upgrade_service.resume_batch(batch_id)
     except UpgradeError as e:
         return JSONResponse({"error": str(e)}, status_code=409)
-    return asdict(batch) | {
-        "status": batch.status.value,
-        "pause_reason": batch.pause_reason.value if batch.pause_reason else None,
-    }
+    return _batch_body(batch)
 
 
 @app.post("/upgrades/batches/{batch_id}/dispatch")
