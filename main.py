@@ -32,6 +32,14 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="IoT Device Twin", lifespan=lifespan)
 
 
+def _batch_view(batch) -> dict:
+    """批次视图：枚举转成可直读的字符串，pause_reason 直接区分暂停/熔断/完成。"""
+    return asdict(batch) | {
+        "status": batch.status.value,
+        "pause_reason": batch.pause_reason.value if batch.pause_reason else None,
+    }
+
+
 @app.get("/")
 def read_root():
     return {"service": "iot-device-twin", "status": "ok"}
@@ -81,10 +89,21 @@ async def create_batch(request: Request):
         )
     except (UpgradeError, ValueError, TypeError) as e:
         return JSONResponse({"error": str(e)}, status_code=409)
-    return asdict(batch) | {
-        "status": batch.status.value,
-        "pause_reason": batch.pause_reason.value if batch.pause_reason else None,
-    }
+    return _batch_view(batch)
+
+
+@app.get("/upgrades/batches")
+async def list_batches():
+    return {"batches": [_batch_view(b) for b in upgrade_service.list_batches()]}
+
+
+@app.get("/upgrades/batches/{batch_id}")
+async def get_batch(batch_id: str):
+    try:
+        batch = upgrade_service.get_batch(batch_id)
+    except UpgradeError:
+        return JSONResponse({"error": "unknown_batch"}, status_code=404)
+    return _batch_view(batch)
 
 
 @app.post("/upgrades/batches/{batch_id}/pause")
@@ -93,10 +112,7 @@ async def pause_batch(batch_id: str):
         batch = upgrade_service.pause_batch(batch_id)
     except UpgradeError as e:
         return JSONResponse({"error": str(e)}, status_code=409)
-    return asdict(batch) | {
-        "status": batch.status.value,
-        "pause_reason": batch.pause_reason.value if batch.pause_reason else None,
-    }
+    return _batch_view(batch)
 
 
 @app.post("/upgrades/batches/{batch_id}/resume")
@@ -105,20 +121,23 @@ async def resume_batch(batch_id: str):
         batch = upgrade_service.resume_batch(batch_id)
     except UpgradeError as e:
         return JSONResponse({"error": str(e)}, status_code=409)
-    return asdict(batch) | {
-        "status": batch.status.value,
-        "pause_reason": batch.pause_reason.value if batch.pause_reason else None,
-    }
+    return _batch_view(batch)
 
 
 @app.post("/upgrades/batches/{batch_id}/dispatch")
 async def dispatch(batch_id: str, request: Request):
     body = await request.json()
     try:
-        task = upgrade_service.dispatch(batch_id, body["device_id"], body["from_version"])
+        task, preempted = upgrade_service.dispatch_with_preemption(
+            batch_id, body["device_id"], body["from_version"]
+        )
     except UpgradeError as e:
         return JSONResponse({"error": str(e)}, status_code=409)
-    return asdict(task) | {"status": task.status.value}
+    return asdict(task) | {
+        "status": task.status.value,
+        "preempted_task_id": preempted.task_id if preempted is not None else None,
+        "preempted_batch_id": preempted.batch_id if preempted is not None else None,
+    }
 
 
 @app.post("/upgrades/tasks/{task_id}/progress")

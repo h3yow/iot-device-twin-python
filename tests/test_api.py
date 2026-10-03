@@ -69,3 +69,39 @@ def test_http_end_to_end():
             "min_from_version": "1.0.0", "max_failure_ratio": 0.5, "priority": 7,
         })
         assert r.status_code == 200 and r.json()["priority"] == 7
+
+        # 高优批次抢占仍在途的 b1 任务（b1 此前 downloading，未暂停）
+        r = client.post("/upgrades/batches/b2/dispatch",
+                        json={"device_id": "dev-1", "from_version": "1.2.0"})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["preempted_task_id"] == task_id  # 明确告知抢占了谁
+        assert body["preempted_batch_id"] == "b1"
+
+        # 可直接查询批次状态/停下原因，而不必靠下发报错去猜
+        r = client.post("/upgrades/batches/b1/pause")
+        assert r.status_code == 200
+        r = client.get("/upgrades/batches/b1")
+        assert r.status_code == 200
+        assert r.json()["status"] == "paused"
+        assert r.json()["pause_reason"] == "manual"  # 手动暂停
+        r = client.get("/upgrades/batches/nope")
+        assert r.status_code == 404
+        r = client.get("/upgrades/batches")
+        ids = {b["batch_id"] for b in r.json()["batches"]}
+        assert {"b1", "b2"} <= ids
+        print(f"[判定依据] HTTP 抢占返回 preempted_task_id={task_id[:8]}；"
+              f"GET 批次可直接读到 paused/manual，列表接口返回 {sorted(ids)}")
+
+        # 熔断批次的 pause_reason 也能通过查询接口直接区分
+        client.post("/upgrades/batches/b1/resume")
+        for d in ("d-x1", "d-x2"):
+            rr = client.post("/upgrades/batches/b1/dispatch",
+                             json={"device_id": d, "from_version": "1.0.0"})
+            tt = rr.json()["task_id"]
+            client.post(f"/upgrades/tasks/{tt}/progress", json={"status": "failed"})
+        r = client.get("/upgrades/batches/b1")
+        assert r.json()["status"] == "paused"
+        assert r.json()["pause_reason"] == "circuit_breaker"
+        print("[判定依据] 失败率超门限后 GET b1 -> paused/circuit_breaker，"
+              "与手动暂停、completed 可直接区分")

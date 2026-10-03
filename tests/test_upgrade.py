@@ -3,7 +3,7 @@ import threading
 
 import pytest
 
-from app.models import BatchStatus, PauseReason, UpgradeStatus
+from app.models import BatchStatus, PauseReason, TERMINAL_UPGRADE_STATES, UpgradeStatus
 from app.storage import Storage
 from app.upgrade import UpgradeError, UpgradeService
 
@@ -275,14 +275,142 @@ def test_same_priority_first_created_wins(svc):
     print("[判定依据] 同优先级下 bx1 先创建占用 dx，bx2 不可抢占")
 
 
+def test_high_priority_preempts_inflight_task_dispatched_by_low_priority(svc):
+    service, _ = svc
+    # 低优先创建先下发，任务仍在途（downloading）——旧实现在此把后到的高优
+    # 请求以 "already has active task" 直接挡回，优先级完全失效
+    service.create_batch("b-low", to_version="2.0.0", min_from_version="1.0.0",
+                         max_failure_ratio=0.0, priority=1)
+    low_t = service.dispatch("b-low", "d1", "1.2.0")
+    service.report_progress(low_t.task_id, UpgradeStatus.DOWNLOADING)
+
+    service.create_batch("b-high", to_version="3.0.0", min_from_version="1.0.0",
+                         max_failure_ratio=1.0, priority=10)
+    # 高优后到：不必等低优任务跑完或超时，立即抢到设备
+    high_t = service.dispatch("b-high", "d1", "1.2.0")
+    assert high_t.task_id != low_t.task_id
+
+    # 低优在途任务被干净置为 cancelled（终态），设备上唯一进行中任务属于高优
+    old = service._storage.task_for_batch_device("b-low", "d1")
+    assert old.status is UpgradeStatus.CANCELLED
+    assert service._storage.active_task_for_device("d1").task_id == high_t.task_id
+    assert service._holder_of("d1").batch_id == "b-high"
+
+    # 被抢占任务此后再回报一律被终态规则拒绝，不会把设备状态写回高优任务
+    with pytest.raises(UpgradeError, match="terminal"):
+        service.report_progress(low_t.task_id, UpgradeStatus.FLASHING)
+    # 抢占取消不计失败：max_failure_ratio=0.0 的低优批次没有被熔断
+    assert service._storage.load_batch("b-low").status is BatchStatus.RUNNING
+    print(f"[判定依据] 低优在途任务 {low_t.task_id[:8]} 被后到高优任务 "
+          f"{high_t.task_id[:8]} 抢占：旧任务 cancelled 且不计失败，"
+          f"d1 唯一在途任务属于 b-high")
+
+
+def test_low_priority_cannot_take_back_after_high_priority_takes_over(svc):
+    service, _ = svc
+    service.create_batch("b-low", to_version="2.0.0", min_from_version="1.0.0",
+                         max_failure_ratio=1.0, priority=1)
+    low_t = service.dispatch("b-low", "d1", "1.2.0")
+
+    service.create_batch("b-high", to_version="3.0.0", min_from_version="1.0.0",
+                         max_failure_ratio=1.0, priority=10)
+    high_t = service.dispatch("b-high", "d1", "1.2.0")  # 抢占，低优任务 cancelled
+    service.report_progress(high_t.task_id, UpgradeStatus.DOWNLOADING)
+
+    # 低优批次无论继续推进还是暂停恢复后再来，都不能把 d1 抢回：
+    # 其名下已有该设备的 cancelled 记录，同批次设备唯一约束先挡下
+    with pytest.raises(UpgradeError, match="already dispatched"):
+        service.dispatch("b-low", "d1", "1.2.0")
+    service.pause_batch("b-low")
+    service.resume_batch("b-low")
+    with pytest.raises(UpgradeError, match="already dispatched"):
+        service.dispatch("b-low", "d1", "1.2.0")
+    # 高优任务正常在跑，同一台设备从未被下发第二次（每批次一行）
+    assert service._storage.active_task_for_device("d1").task_id == high_t.task_id
+    low_rows = [t for t in service._storage.load_tasks("b-low") if t.device_id == "d1"]
+    assert len(low_rows) == 1 and low_rows[0].task_id == low_t.task_id
+    print("[判定依据] 高优接管后，低优继续推进与暂停恢复后重发都被 already "
+          "dispatched 挡回；d1 在每个批次各只有一行，未被下发两次")
+
+
+def test_rejected_batch_leaves_no_half_state(svc):
+    service, _ = svc
+    service.create_batch("b-low", to_version="2.0.0", min_from_version="1.0.0",
+                         max_failure_ratio=1.0, priority=1)
+    service.dispatch("b-low", "d1", "1.2.0")
+    service.create_batch("b-high", to_version="3.0.0", min_from_version="1.0.0",
+                         max_failure_ratio=1.0, priority=10)
+    service.dispatch("b-high", "d1", "1.2.0")  # 高优占住 d1
+    service.create_batch("b-mid", to_version="2.5.0", min_from_version="1.0.0",
+                         max_failure_ratio=1.0, priority=5)
+
+    with pytest.raises(UpgradeError, match="cannot preempt"):
+        service.dispatch("b-mid", "d1", "1.2.0")
+    # 被挡下：b-mid 名下没有 d1 的任何记录（连 cancelled 行都没有），
+    # d1 的在途任务状态完全不受影响，b-mid 仍可下发其他设备
+    assert service._storage.task_for_batch_device("b-mid", "d1") is None
+    active = service._storage.active_task_for_device("d1")
+    assert active.batch_id == "b-high" and active.status is UpgradeStatus.PENDING
+    other = service.dispatch("b-mid", "d2", "1.2.0")
+    print(f"[判定依据] b-mid 抢 d1 被挡后无任务行、d1 在途任务不受影响；"
+          f"b-mid 对其他设备 d2 正常下发 {other.task_id[:8]}")
+
+
+def test_paused_batch_inflight_task_is_released_immediately_on_contention(svc):
+    service, _ = svc
+    service.create_batch("b-low", to_version="2.0.0", min_from_version="1.0.0",
+                         max_failure_ratio=1.0, priority=1)
+    low_t = service.dispatch("b-low", "d1", "1.2.0")
+    service.report_progress(low_t.task_id, UpgradeStatus.DOWNLOADING)
+    # 低优批次暂停（手动）：不再参与属主排名；在途任务无人争抢时可自然结束，
+    # 但其他 RUNNING 批次一来抢，立即释放，不必等超时
+    service.pause_batch("b-low")
+    assert service._holder_of("d1") is None
+
+    service.create_batch("b-mid", to_version="2.5.0", min_from_version="1.0.0",
+                         max_failure_ratio=1.0, priority=5)
+    mid_t = service.dispatch("b-mid", "d1", "1.2.0")
+    old = service._storage.task_for_batch_device("b-low", "d1")
+    assert old.status is UpgradeStatus.CANCELLED
+    assert service._storage.active_task_for_device("d1").task_id == mid_t.task_id
+    print(f"[判定依据] b-low 暂停后 d1 名额立即空出，b-mid 下发即接管 "
+          f"{mid_t.task_id[:8]}，原在途任务 {low_t.task_id[:8]} cancelled")
+
+
+def test_circuit_breaker_inflight_task_is_released_immediately_on_contention(svc):
+    service, now = svc
+    service.create_batch("b-a", to_version="2.0.0", min_from_version="1.0.0",
+                         max_failure_ratio=0.5)
+    t1 = service.dispatch("b-a", "d1", "1.2.0")
+    t2 = service.dispatch("b-a", "d2", "1.2.0")
+    t3 = service.dispatch("b-a", "d3", "1.2.0")
+    service.report_progress(t1.task_id, UpgradeStatus.DOWNLOADING)  # d1 在途
+    service.report_progress(t2.task_id, UpgradeStatus.FAILED)
+    service.report_progress(t3.task_id, UpgradeStatus.FAILED)  # 2/3 失败 -> 熔断
+    batch_a = service._storage.load_batch("b-a")
+    assert batch_a.status is BatchStatus.PAUSED
+    assert batch_a.pause_reason is PauseReason.CIRCUIT_BREAKER
+    # 熔断瞬间 d1 名额即退出属主排名，其他 RUNNING 批次可立即接管在途设备
+    assert service._holder_of("d1") is None
+    service.create_batch("b-b", to_version="3.0.0", min_from_version="1.0.0",
+                         max_failure_ratio=1.0, priority=0)
+    tb = service.dispatch("b-b", "d1", "1.2.0")
+    assert service._storage.active_task_for_device("d1").task_id == tb.task_id
+    assert service._storage.task_for_batch_device("b-a", "d1").status is UpgradeStatus.CANCELLED
+    # 熔断批次在途任务被取消也不算失败（否则会在熔断状态上重复统计）
+    print(f"[判定依据] b-a 熔断后 d1（在途）名额立即释放，b-b 接管 "
+          f"{tb.task_id[:8]}，原在途任务 cancelled 且不重复计失败")
+
+
 def test_concurrent_cross_batch_dispatch_single_winner_no_half_state(svc):
     service, _ = svc
-    # 3 个同优先级批次，12 线程并发抢同一台全新设备
-    for name in ("c1", "c2", "c3"):
+    # 3 个不同优先级批次，12 线程并发抢同一台全新设备
+    for name, prio in (("c-low", -1), ("c-mid", 5), ("c-high", 10)):
         service.create_batch(name, to_version="2.0.0", min_from_version="1.0.0",
-                             max_failure_ratio=1.0, priority=1)
+                             max_failure_ratio=1.0, priority=prio)
     results, errors = [], []
     barrier = threading.Barrier(12)
+    names = ("c-low", "c-mid", "c-high")
 
     def worker(batch):
         barrier.wait()
@@ -293,16 +421,28 @@ def test_concurrent_cross_batch_dispatch_single_winner_no_half_state(svc):
 
     threads = []
     for i in range(12):
-        threads.append(threading.Thread(target=worker, args=(f"c{i % 3 + 1}",)))
+        threads.append(threading.Thread(target=worker, args=(names[i % 3],)))
     for t in threads:
         t.start()
     for t in threads:
         t.join()
 
-    assert len(results) == 1 and len(errors) == 11
-    # 设备名下全局只有一个进行中任务，没有任何半推半就的残留
+    # 无论线程实际调度顺序如何（高优可能先到也可能后到），收敛结果必须确定：
+    # 1) 设备全局只有一个进行中任务，且属主一定是最高优先级批次；
+    # 2) 每个 (批次,设备) 至多一行，被抢占方只允许留下干净的 cancelled 终态行
+    #    （不是半推半就的中间状态），纯被挡下的批次则一行都没有；
+    # 3) 高优批次自己的重复下发被同批次唯一约束挡回，不会出现两行。
     all_tasks = [t for t in service._storage.load_tasks() if t.device_id == "shared"]
-    assert len(all_tasks) == 1
-    assert service._storage.active_task_for_device("shared") is not None
-    print(f"[判定依据] 12 线程跨 3 批次并发抢 shared：成功={len(results)} "
-          f"拒绝={len(errors)}，任务总数={len(all_tasks)}（无中间残留）")
+    active = [t for t in all_tasks if t.status not in TERMINAL_UPGRADE_STATES]
+    assert len(active) == 1
+    assert active[0].batch_id == "c-high"
+    assert {t.batch_id for t in all_tasks} <= {"c-low", "c-mid", "c-high"}
+    assert all(
+        t.status is UpgradeStatus.CANCELLED
+        for t in all_tasks if t.batch_id != "c-high"
+    )
+    high_rows = [t for t in all_tasks if t.batch_id == "c-high"]
+    assert len(high_rows) == 1
+    print(f"[判定依据] 12 线程跨 3 优先级批次并发抢 shared：成功={len(results)} "
+          f"拒绝={len(errors)}，任务行={len(all_tasks)}；唯一在途任务属 c-high，"
+          f"其余批次仅有 cancelled 终态行或无记录，无中间残留")
